@@ -33,6 +33,7 @@ import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { extractPages, getPdfPageCount, normalizePageRangeStr, parsePageRangeStr } from "@/lib/pdf"
 import { recordServerUsage } from "@/lib/recents"
 import type { CheckUserResult, PrintServer, QueuedFile } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -41,28 +42,25 @@ interface PrintFormProps {
   servers: PrintServer[]
 }
 
+function isPdf(file: File) {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")
+}
+
 function fileExtIcon(name: string) {
   const ext = name.split(".").pop()?.toLowerCase()
   switch (ext) {
-    case "pdf":
-      return "📄"
+    case "pdf":   return "📄"
     case "doc":
-    case "docx":
-      return "📝"
+    case "docx":  return "📝"
     case "ppt":
-    case "pptx":
-      return "📊"
+    case "pptx":  return "📊"
     case "xls":
-    case "xlsx":
-      return "📈"
+    case "xlsx":  return "📈"
     case "jpg":
     case "jpeg":
-    case "png":
-      return "🖼️"
-    case "txt":
-      return "📃"
-    default:
-      return "📎"
+    case "png":   return "🖼️"
+    case "txt":   return "📃"
+    default:      return "📎"
   }
 }
 
@@ -84,25 +82,76 @@ function StatusBadge({ status }: { status: QueuedFile["status"] }) {
       )
     case "success":
       return (
-        <Badge
-          variant="secondary"
-          className="gap-1 bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-        >
+        <Badge variant="secondary" className="gap-1 bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
           <CheckCircle2 className="size-3" />
           Queued
         </Badge>
       )
     case "failed":
       return (
-        <Badge
-          variant="secondary"
-          className="gap-1 bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
-        >
+        <Badge variant="secondary" className="gap-1 bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">
           <XCircle className="size-3" />
           Failed
         </Badge>
       )
   }
+}
+
+function PageRangeInput({
+  item,
+  onRangeChange,
+}: {
+  item: QueuedFile
+  onRangeChange: (id: string, value: string) => void
+}) {
+  const total = item.pageCount
+  const value = item.pageRangeStr ?? ""
+
+  if (!total) {
+    return <span className="text-xs text-muted-foreground">reading…</span>
+  }
+
+  const parsed = parsePageRangeStr(value, total)
+  const isInvalid = value.trim() !== "" && parsed === null
+  const pageCount = parsed ? parsed.length : total
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="shrink-0 text-xs text-muted-foreground">Pages</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onRangeChange(item.id, e.target.value)}
+        placeholder={`1–${total}`}
+        aria-label="Page range"
+        className={cn(
+          "w-36 rounded border bg-background px-2 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring",
+          isInvalid && "border-destructive focus:ring-destructive",
+        )}
+      />
+      {isInvalid ? (
+        <span className="text-xs text-destructive">invalid range</span>
+      ) : (
+        <span className="text-xs text-muted-foreground">
+          {pageCount} of {total} {pageCount === 1 ? "page" : "pages"}
+        </span>
+      )}
+      {parsed && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => onRangeChange(item.id, normalizePageRangeStr(parsed))}
+              className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              Dedup
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>Deduplicate and compact ranges</TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  )
 }
 
 export function PrintForm({ servers }: PrintFormProps) {
@@ -114,7 +163,6 @@ export function PrintForm({ servers }: PrintFormProps) {
   const [isPrinting, setIsPrinting] = React.useState(false)
   const [progress, setProgress] = React.useState(0)
 
-  // Dialog state: set when Result:1 (existing queued job found)
   const [confirmDialog, setConfirmDialog] = React.useState<{
     userId: number
     queue: QueuedFile[]
@@ -123,6 +171,13 @@ export function PrintForm({ servers }: PrintFormProps) {
   const pendingCount = files.filter((f) => f.status === "pending" || f.status === "failed").length
   const successCount = files.filter((f) => f.status === "success").length
   const hasFiles = files.length > 0
+  const hasInvalidRange = files.some(
+    (f) =>
+      (f.status === "pending" || f.status === "failed") &&
+      f.pageCount &&
+      f.pageRangeStr?.trim() &&
+      parsePageRangeStr(f.pageRangeStr, f.pageCount) === null,
+  )
 
   const addFiles = (newFiles: File[]) => {
     const queued: QueuedFile[] = newFiles.map((file) => ({
@@ -131,6 +186,24 @@ export function PrintForm({ servers }: PrintFormProps) {
       status: "pending",
     }))
     setFiles((prev) => [...prev, ...queued])
+
+    // Read page counts for PDFs asynchronously
+    for (const item of queued) {
+      if (!isPdf(item.file)) continue
+      getPdfPageCount(item.file)
+        .then((count) => {
+          setFiles((prev) =>
+            prev.map((f) =>
+              f.id === item.id
+                ? { ...f, pageCount: count }
+                : f,
+            ),
+          )
+        })
+        .catch(() => {
+          // Non-fatal: encrypted or malformed PDF — just skip range UI
+        })
+    }
   }
 
   const removeFile = (id: string) => setFiles((prev) => prev.filter((f) => f.id !== id))
@@ -142,11 +215,15 @@ export function PrintForm({ servers }: PrintFormProps) {
 
   const clearCompleted = () => setFiles((prev) => prev.filter((f) => f.status !== "success"))
 
+  const setPageRange = (id: string, value: string) =>
+    setFiles((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, pageRangeStr: value } : f)),
+    )
+
   const executePrint = async (queue: QueuedFile[]) => {
     setIsPrinting(true)
     setProgress(0)
 
-    // Find the server label for recording usage
     const server = servers.find((s) => s.url === serverUrl)
 
     let done = 0
@@ -154,11 +231,20 @@ export function PrintForm({ servers }: PrintFormProps) {
       setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "uploading" } : f)))
 
       try {
+        // Extract page range if the user specified one
+        let fileToSend = item.file
+        if (item.pageCount && item.pageRangeStr?.trim()) {
+          const indices = parsePageRangeStr(item.pageRangeStr, item.pageCount)
+          if (indices && indices.length < item.pageCount) {
+            fileToSend = await extractPages(item.file, indices)
+          }
+        }
+
         const form = new FormData()
         form.append("serverUrl", serverUrl)
         form.append("loginName", username)
         form.append("password", password)
-        form.append("file", item.file, item.file.name)
+        form.append("file", fileToSend, item.file.name)
 
         const res = await fetch("/api/print", { method: "POST", body: form })
         const data: { result: string; error?: string } = await res.json()
@@ -198,7 +284,6 @@ export function PrintForm({ servers }: PrintFormProps) {
     const queue = files.filter((f) => f.status === "pending" || f.status === "failed")
     if (queue.length === 0) { toast.info("No files to print"); return }
 
-    // Pre-submit credential check
     setIsPrinting(true)
     let checkData: CheckUserResult
     try {
@@ -223,12 +308,10 @@ export function PrintForm({ servers }: PrintFormProps) {
     setIsPrinting(false)
 
     if (checkData.result === 1) {
-      // Existing queued job found — ask user to confirm
       setConfirmDialog({ userId: checkData.userId, queue })
       return
     }
 
-    // result === 2 (no existing job / unknown user) → proceed directly
     await executePrint(queue)
   }
 
@@ -340,57 +423,66 @@ export function PrintForm({ servers }: PrintFormProps) {
             {hasFiles && (
               <>
                 <Separator />
-                <ScrollArea className={cn("pr-2", files.length > 4 && "h-56")}>
+                <ScrollArea className={cn("pr-2", files.length > 4 && "h-64")}>
                   <ul className="space-y-2">
                     {files.map((item) => (
                       <li
                         key={item.id}
-                        className="flex items-center gap-3 rounded-md border bg-card px-3 py-2.5 text-sm"
+                        className="rounded-md border bg-card px-3 py-2.5 text-sm"
                       >
-                        <span className="text-base leading-none" aria-hidden>
-                          {fileExtIcon(item.file.name)}
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate font-medium">{item.file.name}</p>
-                          <p className="text-xs text-muted-foreground">
-                            {formatBytes(item.file.size)}
-                            {item.error && (
-                              <span className="ml-2 text-destructive">{item.error}</span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-base leading-none" aria-hidden>
+                            {fileExtIcon(item.file.name)}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate font-medium">{item.file.name}</p>
+                            <p className="text-xs text-muted-foreground">
+                              {formatBytes(item.file.size)}
+                              {item.error && (
+                                <span className="ml-2 text-destructive">{item.error}</span>
+                              )}
+                            </p>
+                          </div>
+                          <StatusBadge status={item.status} />
+                          <div className="flex shrink-0 gap-1">
+                            {item.status === "failed" && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="size-7 text-muted-foreground"
+                                    onClick={() => retryFile(item.id)}
+                                  >
+                                    <RotateCcw className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Retry</TooltipContent>
+                              </Tooltip>
                             )}
-                          </p>
-                        </div>
-                        <StatusBadge status={item.status} />
-                        <div className="flex shrink-0 gap-1">
-                          {item.status === "failed" && (
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <Button
                                   variant="ghost"
                                   size="icon"
                                   className="size-7 text-muted-foreground"
-                                  onClick={() => retryFile(item.id)}
+                                  onClick={() => removeFile(item.id)}
+                                  disabled={item.status === "uploading"}
                                 >
-                                  <RotateCcw className="size-3.5" />
+                                  <XCircle className="size-3.5" />
                                 </Button>
                               </TooltipTrigger>
-                              <TooltipContent>Retry</TooltipContent>
+                              <TooltipContent>Remove</TooltipContent>
                             </Tooltip>
-                          )}
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="size-7 text-muted-foreground"
-                                onClick={() => removeFile(item.id)}
-                                disabled={item.status === "uploading"}
-                              >
-                                <XCircle className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>Remove</TooltipContent>
-                          </Tooltip>
+                          </div>
                         </div>
+
+                        {/* Page range — PDFs only, not shown after success */}
+                        {isPdf(item.file) && item.status !== "success" && (
+                          <div className="mt-2 flex items-center gap-2 pl-7">
+                            <PageRangeInput item={item} onRangeChange={setPageRange} />
+                          </div>
+                        )}
                       </li>
                     ))}
                   </ul>
@@ -424,7 +516,7 @@ export function PrintForm({ servers }: PrintFormProps) {
             size="lg"
             className="w-full gap-2"
             onClick={printAll}
-            disabled={isPrinting || !hasFiles || pendingCount === 0}
+            disabled={isPrinting || !hasFiles || pendingCount === 0 || hasInvalidRange}
           >
             {isPrinting ? (
               <Loader2 className="size-4 animate-spin" />

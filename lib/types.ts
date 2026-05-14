@@ -17,4 +17,6 @@ export interface QueuedFile {
   file: File
   status: FileStatus
   error?: string
+  pageCount?: number
+  pageRangeStr?: string
 }
